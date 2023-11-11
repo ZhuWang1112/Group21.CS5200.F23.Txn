@@ -1,0 +1,7 @@
+"0","library(sqldf)"
+"0","#library(lubridate)"
+"0",""
+"0","options(sqldf.driver = ""SQLite"")"
+"0",""
+"0","# read csv file"
+"0","df.raw <- read.csv(""BirdStrikesData-V2.csv"", header = TRUE, stringsAsFactors = FALSE)"

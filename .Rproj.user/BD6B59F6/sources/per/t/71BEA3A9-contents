@@ -1,0 +1,446 @@
+---
+title: "Implement Transactions"
+output: pdf_document
+author: Weihao Gu   Sumayya Naseem    Zhu Wang   Andy Yu 
+date: Fall 2023
+---
+
+## Install libs
+```{r installLibs, eval = T, warning = F}
+#install.packages("RMySQL")
+#tinytex::install_tinytex()
+```
+
+## Connect to Database
+```{r connectToDB, eval = T, warning = F}
+# 1. Library
+library(RMySQL)
+
+db_name_fh <- "cs5200p1"
+db_user_fh <- "cs5200p1"
+db_host_fh <- "cs5200p1.cacksyfuxa2b.us-west-1.rds.amazonaws.com"
+db_pwd_fh <- "12345678"
+db_port_fh <- 3306
+
+# 3. Connect to remote server database
+mydb.fh <-  dbConnect(MySQL(), user = db_user_fh, password = db_pwd_fh,
+                      dbname = db_name_fh, host = db_host_fh, port = db_port_fh)
+mydb <- mydb.fh
+```
+
+## Create Database
+```{sql dropStrikes, connection=mydb}
+DROP TABLE IF EXISTS strikes;
+```
+
+```{sql dropFlights, connection=mydb}
+DROP TABLE IF EXISTS flights;
+```
+
+```{sql dropAirports, connection=mydb}
+DROP TABLE IF EXISTS airports;
+```
+
+```{sql dropConditions, connection=mydb}
+DROP TABLE IF EXISTS conditions;
+```
+
+```{sql createFlights, connection=mydb}
+CREATE TABLE IF NOT EXISTS flights (
+    fid INT PRIMARY KEY AUTO_INCREMENT,
+    date DATE,
+    origin INT,
+    airline VARCHAR(100) DEFAULT 'unknown',
+    aircraft VARCHAR(100),
+    altitude INT CHECK(altitude >= 0),
+    heavy BOOLEAN
+);
+```
+
+```{sql createAirports, connection=mydb}
+CREATE TABLE IF NOT EXISTS airports (
+    aid INT PRIMARY KEY AUTO_INCREMENT,
+    airportName VARCHAR(100) DEFAULT 'unknown',
+    airportState VARCHAR(100),
+    airportCode VARCHAR(10) DEFAULT ''
+);
+```
+
+```{sql addFK, connection=mydb}
+ALTER TABLE flights
+ADD FOREIGN KEY (origin) REFERENCES airports(aid);
+```
+
+```{sql createConditions, connection=mydb}
+CREATE TABLE IF NOT EXISTS conditions (
+  cid INT PRIMARY KEY AUTO_INCREMENT, 
+  sky_condition VARCHAR(100), 
+  explanation VARCHAR(300) DEFAULT ''
+);
+```
+
+```{sql createStrikes, connection=mydb}
+CREATE TABLE IF NOT EXISTS strikes (
+  sid INT PRIMARY KEY AUTO_INCREMENT, 
+  fid INT,
+  numbirds INT,
+  impact VARCHAR(100),
+  damage BOOLEAN,
+  altitude INT CHECK(altitude >= 0),
+  conditions INT,
+  FOREIGN KEY (fid) REFERENCES flights(fid),
+  FOREIGN KEY (conditions) REFERENCES conditions(cid)
+);
+```
+
+## Load CSV
+```{r readCSV, eval = T, warning = F}
+library(sqldf)
+#library(lubridate)
+
+options(sqldf.driver = "SQLite")
+
+# read csv file
+df.raw <- read.csv("BirdStrikesData-V2.csv", header = TRUE, stringsAsFactors = FALSE)
+```
+
+## Load the airports data
+```{r loadAirports, eval = T, warning = F}
+df.airports <- sqldf("
+  SELECT 1 AS aid, airport AS airportName, origin AS airportState, '' AS airportCode
+  FROM `df.raw`
+  WHERE airport != '' AND origin != ''
+  GROUP BY airport
+")
+
+
+# before insert the data, set a sentinel airport called "unknown"
+dbExecute(mydb, "INSERT INTO airports VALUES (1, 'unknown', 'unknown', 'unknown')")
+
+# get the total rows of the df, then create synthetic primary key
+n.airports <- nrow(df.airports)
+df.airports[, 1] <- seq(2, n.airports + 1)
+
+dbWriteTable(mydb, "airports", df.airports, overwrite = FALSE, append = TRUE, row.names = FALSE)
+
+# check
+#dbReadTable(mydb, 'airports')
+```
+
+## Load the flights data
+```{r loadFlights, eval = T, warning = F}
+df.flights <- sqldf("
+  SELECT 1 AS fid, 
+  flight_date,
+  1 AS origin,
+  airport,
+  airline,
+  aircraft,
+  altitude_ft AS altitude,
+  heavy_flag,
+  rid
+  FROM `df.raw`
+")
+
+# get the total rows of the df, then create synthetic primary key
+n.flights <- nrow(df.flights)
+
+for (i in 1: n.flights) {
+  
+  df.flights$fid[i] <- i
+  
+  # about the data 11/23/2000  12:00:00 AM -> 11/23/2000
+  old.date <- df.flights$flight_date[i]
+  if (!is.na(old.date) && old.date != '') {
+    temp.date <- as.Date(old.date, format = "%m/%d/%y")
+    df.flights$flight_date[i] = as.character(temp.date)
+  }
+  
+# set the foreign id of airport ----> origin
+  aid <- df.airports$aid[which(df.airports$airportName == df.flights$airport[i])]
+  
+  # if there is no airport, link it to a sentinel airport "unknown"
+  if (length(aid) == 0 || is.null(aid)) {
+    aid <- 1
+  }
+  df.flights$origin[i] <- aid
+  
+# if there is no airline, set it "unknown" in stead of leaving it empty
+  if (length(df.flights$airline[i]) == 0 || is.na(df.flights$airline[i]) 
+                                          || df.flights$airline[i] == '') {
+    df.flights$airline[i] <- 'unknown'
+  }
+  
+  if (df.flights$heavy_flag[i] == 'Yes') {
+      df.flights$heavy[i] <- 1
+    } else if (df.flights$heavy_flag[i] == 'No') {
+      df.flights$heavy[i] <- 0
+    } else {
+      df.flights$heavy[i] <- NA
+    }
+}
+
+df.flights$date = as.Date(df.flights$flight_date)
+df.flights$heavy <- as.integer(df.flights$heavy)
+df.flights$altitudeInt <- as.integer(gsub(",", "", df.flights$altitude))
+
+new.df.flights <- sqldf("
+  SELECT fid, date, origin, airline, aircraft, altitudeInt AS altitude, heavy
+  FROM `df.flights`
+")
+
+dbWriteTable(mydb, "flights", new.df.flights, overwrite = FALSE, append = TRUE, row.names = FALSE)
+
+# check
+#dbReadTable(mydb, 'flights')
+```
+
+# Load the conditions data
+```{r loadConditions, eval = T, warning = F}
+df.conditions <- sqldf("
+  SELECT 1 AS cid, sky_conditions AS sky_condition, '' AS explanation
+  FROM `df.raw`
+  GROUP BY sky_condition
+")
+
+n.conditions <- nrow(df.conditions)
+df.conditions[, 1] <- seq(1, n.conditions)
+
+dbWriteTable(mydb, "conditions", df.conditions, overwrite = FALSE, append = TRUE, row.names = FALSE)
+
+# check
+#dbReadTable(mydb, 'conditions')
+```
+
+## Load the strikes data
+```{r loadStrikes, eval = T, warning = F}
+df.strikes <- sqldf("
+  SELECT 1 AS sid, 
+  1 AS fid, 
+  wildlife_struck AS numbirds, 
+  impact, 
+  damage,
+  altitude_ft AS altitude, 
+  1 AS conditions,
+  rid,
+  sky_conditions
+  FROM `df.raw`
+")
+
+n.strikes <- nrow(df.strikes)
+
+for (i in 1: n.strikes) {
+  
+  df.strikes$sid[i] <- i
+  
+  df.strikes$fid[i] <- df.flights$fid[which(df.flights$rid == df.strikes$rid[i])]
+  
+  if (df.strikes$damage[i] == 'Caused damage') {
+    df.strikes$damageBool[i] <- 1
+  } else if (df.strikes$damage[i] == 'No damage') {
+    df.strikes$damageBool[i] <- 0
+  }
+  df.strikes$altitudeInt[i] <- as.integer(gsub(",", "", df.strikes$altitude[i]))
+  df.strikes$conditions[i] <- 
+    df.conditions$cid[which(df.conditions$sky_condition == df.strikes$sky_conditions[i])]
+  
+}
+
+df.strikes$damageBool <- as.integer(df.strikes$damageBool)
+
+new.df.strikes <- sqldf("
+  SELECT sid, 
+  fid, 
+  numbirds, 
+  impact, 
+  damageBool AS damage,
+  altitudeInt AS altitude, 
+  conditions
+  FROM `df.strikes`
+")
+
+dbWriteTable(mydb, "strikes", new.df.strikes, overwrite = FALSE, append = TRUE, row.names = FALSE)
+
+# check
+#dbReadTable(mydb, 'strikes')
+```
+
+## Stored Procedure
+```{sql dropStoredProcedure, connection=mydb}
+DROP PROCEDURE IF EXISTS AddBirdStrike;
+```
+
+```{sql createStoredProcedure, connection=mydb}
+CREATE PROCEDURE AddBirdStrike(
+    IN flight_date DATE,
+    IN origin_airportCode VARCHAR(10),
+    IN origin_airportName VARCHAR(100),
+    IN origin_airportState VARCHAR(100),
+    IN airline_name VARCHAR(100),
+    IN aircraft_name VARCHAR(100),
+    IN altitude INT,
+    IN flight_heavy BOOLEAN,
+    IN num_birds INT,
+    IN strike_impact VARCHAR(100),
+    IN strike_damage BOOLEAN,
+    IN sky_cond VARCHAR(100),
+    IN cond_explanation VARCHAR(300)
+)
+BEGIN
+    DECLARE airport_id INT;
+    DECLARE flight_id INT;
+    DECLARE condition_id INT;
+    
+    -- Add or get the airport
+    SELECT aid INTO airport_id FROM airports WHERE airportName = origin_airportName;
+    IF airport_id IS NULL THEN
+        INSERT INTO airports(airportName, airportState, airportCode) 
+        VALUES(origin_airportName, origin_airportState, origin_airportCode);
+        SET airport_id = LAST_INSERT_ID();
+    END IF;
+    
+    -- Add the flight
+    INSERT INTO flights(date, origin, airline, aircraft, altitude, heavy) 
+    VALUES(flight_date, airport_id, airline_name, aircraft_name, altitude, flight_heavy);
+    SET flight_id = LAST_INSERT_ID();
+    
+    -- Add or get the condition
+    SELECT cid INTO condition_id FROM conditions WHERE sky_condition = sky_cond;
+    IF condition_id IS NULL THEN
+        INSERT INTO conditions(sky_condition, explanation) 
+        VALUES(sky_cond, cond_explanation);
+        SET condition_id = LAST_INSERT_ID();
+    END IF;
+    
+    -- Add the strike
+    INSERT INTO strikes(fid, numbirds, impact, damage, altitude, conditions) 
+    VALUES(flight_id, num_birds, strike_impact, strike_damage, altitude, condition_id);
+END
+
+```
+
+## Upload new csv
+```{r callStoredProcedure, eval = T, warning = F}
+# Call the stored procedure
+#dbExecute(mydb, "CALL AddBirdStrike('2023-10-21', 'SFO', 'San Francisco International Airport', 
+#          'California', 'Delta', 'Boeing 777', 10000, TRUE, 3, 'Engine Shut Down', TRUE, 
+#          'Some Cloud', 'It was a cloudy day.')")
+
+new_data <- read.csv("strikes_Zhu Wang.csv", header = TRUE, stringsAsFactors = FALSE)
+
+dbExecute(mydb, "START TRANSACTION")
+txnFailed <- FALSE
+
+for (i in 1:nrow(new_data)) {
+  row <- new_data[i, ]
+
+  ##### airports table
+  aid <- NA
+  # Check if the airport already exists
+  check_airport_sql <- sprintf("SELECT aid FROM airports WHERE airportName = '%s'", row$airport)
+  ps <- dbSendQuery(mydb, check_airport_sql)
+  existing_airport <- dbFetch(ps, n = 1)
+  dbClearResult(ps)
+  if (nrow(existing_airport) > 0) {
+    # If the airport already exists
+    aid <- existing_airport$aid
+  } else {
+    # Otherwise, insert the new airport record
+    insert_airport_sql <- sprintf("INSERT INTO airports (airportName, airportState) VALUES ('%s', '%s')", row$airport, row$origin)
+    ps <- dbSendStatement(mydb, insert_airport_sql)
+    if (dbGetRowsAffected(ps) < 1) { 
+      txnFailed <- TRUE; 
+      dbClearResult(ps); 
+      break }
+    dbClearResult(ps)
+
+    # Get the aid for the latest inserted airport row
+    aid <- dbGetQuery(mydb, "SELECT LAST_INSERT_ID() as aid")$aid
+  }
+  
+  ##### flights table
+  new.date <- NA
+  old.date <- row$flight_date
+  if (!is.na(old.date) && old.date != '') {
+    temp.date <- as.Date(old.date, format = "%m/%d/%y")
+    new.date = as.character(temp.date)
+  }
+  formatted_date <- as.Date(new.date)
+  
+  # Formatting heavy
+  formatted_heavy <- as.integer(ifelse(row$heavy_flag == "Yes", 1, 0))  # 转换为 1 或 0
+
+  # Formatting altitude
+  formatted_altitude <- as.integer(gsub(",", "", row$altitude_ft))  # 移除逗号并转换为整数
+
+  # insert flights table
+  flight_insert_sql <- sprintf("INSERT INTO flights (date, origin, airline, aircraft, altitude, heavy) VALUES ('%s', %d, '%s', '%s', %d, %d)",as.character(formatted_date), aid, row$airline, row$aircraft, formatted_altitude, formatted_heavy)
+  ps <- dbSendStatement(mydb, flight_insert_sql)
+  if (dbGetRowsAffected(ps) < 1) {
+    txnFailed <- TRUE
+    dbClearResult(ps)
+    break
+  }
+  dbClearResult(ps)
+  fid <- dbGetQuery(mydb, "SELECT LAST_INSERT_ID() as fid")$fid
+
+  # conditions table
+  cid <- NA
+  check_condition_sql <- sprintf("SELECT cid FROM conditions WHERE sky_condition = '%s'", row$sky_conditions)
+  ps <- dbSendQuery(mydb, check_condition_sql)
+    existing_condition <- dbFetch(ps, n = 1)
+    dbClearResult(ps)
+    if (nrow(existing_condition) > 0) {
+      # If it exists, use the existing cid
+      cid <- existing_condition$cid
+    } else {
+      # If it doesn't exist, insert a new row
+      insert_condition_sql <- sprintf("INSERT INTO conditions (sky_condition) VALUES ('%s')", row$sky_conditions)
+      ps <- dbSendStatement(mydb, insert_condition_sql)
+      if (dbGetRowsAffected(ps) < 1) { txnFailed <- TRUE; dbClearResult(ps); break }
+      dbClearResult(ps)
+
+      # Gets the cid of the latest inserted row
+      cid <- dbGetQuery(mydb, "SELECT LAST_INSERT_ID() as cid")$cid
+    }
+  if (txnFailed) { 
+    break 
+    }
+
+  ##### strikes table
+    
+  # Formatting damage
+  formatted_damage <- ifelse(row$damage == "Caused damage", 1, 0)
+  
+  # insert strikes table
+  strike_insert_sql <- sprintf("INSERT INTO strikes (fid, numbirds, impact, damage, altitude, conditions) VALUES (%d, %d, '%s', %d, %d, %d)",fid, row$wildlife_struck, row$impact, formatted_damage, formatted_altitude, cid)
+  ps <- dbSendStatement(mydb, strike_insert_sql)
+
+  if (dbGetRowsAffected(ps) < 1) {
+    txnFailed <- TRUE
+    dbClearResult(ps)
+    break
+  }
+  dbClearResult(ps)
+  
+}
+
+if (txnFailed) {
+  dbExecute(mydb, "ROLLBACK")
+} else {
+  dbExecute(mydb, "COMMIT")
+}
+
+if (!txnFailed) {
+  cat('Transfer successful')
+} else {
+  cat('Transfer failed')
+}
+```
+
+## Disconnect DB
+```{r disconnectDB, eval = T, warning = F}
+dbDisconnect(mydb)
+```
+
+
